@@ -42,8 +42,27 @@ public partial class Generator
             TypeHandleInfo releaseMethodParameterTypeHandleInfo = releaseMethodSignature.ParameterTypes[0];
             TypeSyntaxAndMarshaling releaseMethodParameterType = releaseMethodParameterTypeHandleInfo.ToTypeSyntax(this.externSignatureTypeSettings, GeneratingElement.HelperClassMember, default);
 
-            // If the release method takes more than one parameter, we can't generate a SafeHandle for it.
-            if (releaseMethodSignature.RequiredParameterCount != 1)
+            var nonReservedParameterCount = 0;
+            var handleParameterName = string.Empty;
+            foreach (ParameterHandle paramHandle in releaseMethodDef.GetParameters())
+            {
+                Parameter param = this.Reader.GetParameter(paramHandle);
+                if (param.SequenceNumber == 0)
+                {
+                    continue;
+                }
+
+                CustomAttributeHandleCollection paramAttributes = param.GetCustomAttributes();
+
+                if (this.FindInteropDecorativeAttribute(paramAttributes, "ReservedAttribute") is null)
+                {
+                    nonReservedParameterCount++;
+                    handleParameterName = this.Reader.GetString(param.Name);
+                }
+            }
+
+            // If the release method takes more than one non-reserved parameter, we can't generate a SafeHandle for it.
+            if (nonReservedParameterCount != 1)
             {
                 safeHandleType = null;
             }
@@ -138,13 +157,22 @@ public partial class Generator
                 .WithExpressionBody(ArrowExpressionClause(overallTest))
                 .WithSemicolonToken(SemicolonWithLineFeed));
 
-            // (struct)this.handle or (struct)checked((fieldType)(nint))this.handle, as appropriate.
-            bool implicitConversion = typeDefStructFieldType is PrimitiveTypeHandleInfo { PrimitiveTypeCode: PrimitiveTypeCode.IntPtr } or PointerTypeHandleInfo;
-            ArgumentSyntax releaseHandleArgument = Argument(CastExpression(
-                releaseMethodParameterType.Type,
-                implicitConversion ? thisHandle : CheckedExpression(CastExpression(typeDefStructFieldType!.ToTypeSyntax(this.fieldTypeSettings, GeneratingElement.HelperClassMember, null).Type, CastExpression(IdentifierName("nint"), thisHandle)))));
+            // If there are more than 1 parameter other parameters are reserved.
+            // Otherwise we would have quit earlier
+            var releaseMethodHasReservedParameters = releaseMethodSignature.RequiredParameterCount > 1;
 
-            // protected override bool ReleaseHandle() => ReleaseMethod((struct)this.handle);
+            // (struct)this.handle or (struct)checked((fieldType)(nint))this.handle, as appropriate.
+            // If we have other reserved parameters make this a named argument to be extra sure
+            // we are passing value for correct parameter
+            bool implicitConversion = typeDefStructFieldType is PrimitiveTypeHandleInfo { PrimitiveTypeCode: PrimitiveTypeCode.IntPtr } or PointerTypeHandleInfo;
+            ArgumentSyntax releaseHandleArgument = Argument(
+                releaseMethodHasReservedParameters ? NameColon(IdentifierName(handleParameterName)) : null,
+                default,
+                CastExpression(
+                    releaseMethodParameterType.Type,
+                    implicitConversion ? thisHandle : CheckedExpression(CastExpression(typeDefStructFieldType!.ToTypeSyntax(this.fieldTypeSettings, GeneratingElement.HelperClassMember, null).Type, CastExpression(IdentifierName("nint"), thisHandle)))));
+
+            // protected override [unsafe] bool ReleaseHandle() => ReleaseMethod((struct)this.handle);
             // Special case release functions based on their return type as follows: (https://github.com/microsoft/win32metadata/issues/25)
             //  * bool => true is success
             //  * int => zero is success
@@ -157,7 +185,11 @@ public partial class Generator
                     IdentifierName(renamedReleaseMethod ?? releaseMethod)),
                 ArgumentList().AddArguments(releaseHandleArgument));
             BlockSyntax? releaseBlock = null;
-            bool releaseMethodIsUnsafe = false;
+
+            // Reserved parameters can be pointers.
+            // Thus we need unsafe modifier even though we don't pass values for reserved parameters explicitly.
+            // As an example of that see WlanCloseHandle function.
+            var releaseMethodIsUnsafe = releaseMethodHasReservedParameters;
             if (!(releaseMethodReturnType.Type is PredefinedTypeSyntax { Keyword: { RawKind: (int)SyntaxKind.BoolKeyword } } ||
                 releaseMethodReturnType.Type is QualifiedNameSyntax { Right: { Identifier: { ValueText: "BOOL" } } }))
             {
@@ -241,6 +273,7 @@ public partial class Generator
 
             MethodDeclarationSyntax releaseHandleDeclaration = MethodDeclaration(PredefinedType(TokenWithSpace(SyntaxKind.BoolKeyword)), Identifier("ReleaseHandle"))
                 .AddModifiers(TokenWithSpace(SyntaxKind.ProtectedKeyword), TokenWithSpace(SyntaxKind.OverrideKeyword));
+
             if (releaseMethodIsUnsafe)
             {
                 releaseHandleDeclaration = releaseHandleDeclaration.AddModifiers(TokenWithSpace(SyntaxKind.UnsafeKeyword));
@@ -254,6 +287,8 @@ public partial class Generator
                     .WithBody(releaseBlock);
             members.Add(releaseHandleDeclaration);
 
+            IEnumerable<TypeSyntax> xmlDocParameterTypes = releaseMethodSignature.ParameterTypes.Select(p => p.ToTypeSyntax(this.externSignatureTypeSettings, GeneratingElement.HelperClassMember, default).Type);
+
             ClassDeclarationSyntax safeHandleDeclaration = ClassDeclaration(Identifier(safeHandleClassName))
                 .AddModifiers(TokenWithSpace(this.Visibility), TokenWithSpace(SyntaxKind.PartialKeyword))
                 .WithBaseList(BaseList(SingletonSeparatedList<BaseTypeSyntax>(SimpleBaseType(SafeHandleTypeSyntax))))
@@ -261,7 +296,7 @@ public partial class Generator
                 .AddAttributeLists(AttributeList().AddAttributes(GeneratedCodeAttribute))
                 .WithLeadingTrivia(ParseLeadingTrivia($@"
 /// <summary>
-/// Represents a Win32 handle that can be closed with <see cref=""{this.options.ClassName}.{renamedReleaseMethod ?? releaseMethod}({releaseMethodParameterType.Type})""/>.
+/// Represents a Win32 handle that can be closed with <see cref=""{this.options.ClassName}.{renamedReleaseMethod ?? releaseMethod}({string.Join(", ", xmlDocParameterTypes)})""/>.
 /// </summary>
 "));
 
